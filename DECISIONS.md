@@ -2083,10 +2083,12 @@ nvdec через `-hwaccel cuda` работает) и `pip check` (конфли�
 - `warmup` в свежем контейнере с `--network none`: exit 0, 4/4 OK — модели
   берутся только из тома.
 - Том `/cache`: paddlex 137 МБ, pix2tex 116 МБ, gigaam 449 МБ, huggingface 818 МБ.
-- Тесты (`-m "not models and not reference and not slow"`): 551 passed, 2 failed.
-  Оба провала были и до правок, оба зависят от окружения: тесты ждут машину
-  без GPU (`test_verify_env_exits_nonzero_without_gpu`,
-  `test_vlm_бэкенд_честно_говорит_о_требованиях_к_vram`).
+- Тесты (`-m "not models and not reference and not slow"`): 553 passed в контейнере
+  с GPU, 552 passed без GPU. Два теста раньше падали на машине с GPU, потому что
+  проверяли окружение, а не код. `test_verify_env_exits_nonzero_without_gpu`
+  видел настоящий `nvidia-smi` в `/usr/bin`: теперь `PATH` в тестах `verify_env.sh`
+  собирается без `nvidia-smi`/`ffmpeg`/`ffprobe`. `test_vlm_…_vram` получал
+  причину «нет весов Qwen» вместо «нет CUDA»: теперь окружение задаётся фейками.
 - `models`-тесты пропущены: в контейнере нет эталонной записи.
 
 **Не сделано:** `verify_env.sh` (h264_cuvid, pip check) не трогал — см. `TECH_DEBT.md`.
