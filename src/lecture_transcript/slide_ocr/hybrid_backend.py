@@ -30,6 +30,14 @@ from .routing import (
 #: бокс PaddleOCR режет надстрочные индексы вплотную.
 CROP_PADDING_PX = 6
 
+#: Сколько букв и цифр должно быть в отброшенной строке, чтобы она считалась
+#: потерянным содержимым и делала слайд ненадёжным.
+MIN_DROPPED_ALNUM = 2
+
+
+def _alnum_count(text: str) -> int:
+    return sum(1 for ch in text if ch.isalnum())
+
 
 class FormulaRecognizer(Protocol):
     """Минимальный контракт формульного распознавателя для гибрида."""
@@ -89,14 +97,18 @@ class HybridBackend:
         целиком: ни текстом, ни формулой они в результат не идут, доступ к ним
         даёт обязательная ссылка на PNG слайда.
         """
-        raw_lines = list(self.text_backend.recognize(image_path))
-        lines = [
-            fragment
-            for fragment in raw_lines
-            if not looks_like_handwriting(fragment.text, fragment.confidence, self.routing)
-        ]
-        # Отброшенное не теряется молча: сборка пометит слайд ненадёжным.
-        dropped = len(raw_lines) - len(lines)
+        lines: list[OcrFragment] = []
+        dropped = 0
+        for fragment in self.text_backend.recognize(image_path):
+            if not looks_like_handwriting(fragment.text, fragment.confidence, self.routing):
+                lines.append(fragment)
+            elif _alnum_count(fragment.text) >= MIN_DROPPED_ALNUM:
+                # Отброшенное не теряется молча: сборка пометит слайд
+                # ненадёжным. Одиночный символ — не потерянная пометка, а
+                # иконка или картинка, прочитанная как буква: на записи
+                # wr_20261005_1350 значок логотипа («<», 0.27) делал
+                # ненадёжной половину слайдов.
+                dropped += 1
         if not lines:
             return RecognizedFragments((), dropped)
 

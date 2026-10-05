@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import importlib.util
 import os
 import re
@@ -208,5 +209,13 @@ class Pix2TexBackend:
         )
 
     def unload(self) -> None:
-        """Выгрузить модель (design D7)."""
+        """Выгрузить модель и вернуть VRAM следующей стадии (design D7)."""
+        if self._model is None:
+            return
         self._model = None
+        gc.collect()
+        if importlib.util.find_spec("torch") is not None:
+            import torch  # noqa: PLC0415
+
+            if torch.cuda.is_available():  # pragma: no cover — требует CUDA
+                torch.cuda.empty_cache()

@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import gc
 import importlib.util
 import os
 from pathlib import Path
@@ -58,17 +59,27 @@ def paddleocr_init_kwargs(engine_cls: Any, lang: str) -> dict[str, Any]:
     `parse_common_args` и роняет конструктор `ValueError: Unknown argument`;
     `use_angle_cls` там лишь устаревшее имя `use_textline_orientation`.
     2.x принимает прежний набор.
+
+    Предобработку документа 3.x (классификатор ориентации страницы и
+    выпрямление UVDoc) выключаем: она для фото бумажных страниц, а кроп
+    слайда всегда ровный и стоит правильно. На записи wr_20261005_1350
+    классификатор повернул два слайда из четырёх проверенных на 180° (текст
+    распознался вверх ногами), а UVDoc потерял строку заголовка.
     """
     if is_paddleocr_3(engine_cls):
-        return {"lang": lang, "use_textline_orientation": True}
+        return {
+            "lang": lang,
+            "use_doc_orientation_classify": False,
+            "use_doc_unwarping": False,
+            "use_textline_orientation": True,
+        }
     return {"lang": lang, "use_angle_cls": True, "show_log": False}
 
 
 #: Вспомогательные модели конвейера OCR PaddleOCR 3.x: от языка не зависят
-#: (сверено по колесу paddlex 3.2.0, `configs/pipelines/OCR.yaml`).
+#: (сверено по колесу paddlex 3.2.0, `configs/pipelines/OCR.yaml`). Модели
+#: предобработки документа не нужны: она выключена в `paddleocr_init_kwargs`.
 _AUX_MODELS: dict[str, str] = {
-    "doc_orientation_classify": "PP-LCNet_x1_0_doc_ori",
-    "doc_unwarping": "UVDoc",
     "textline_orientation": "PP-LCNet_x1_0_textline_ori",
 }
 
@@ -300,5 +311,18 @@ class PaddleTextBackend:
         return parse_paddle_output(raw)
 
     def unload(self) -> None:
-        """Выгрузить модель (design D7)."""
+        """Выгрузить модель и вернуть VRAM следующей стадии (design D7).
+
+        Без `empty_cache` аллокатор Paddle держит память у себя: на записи
+        wr_20261005_1350 после OCR занятыми оставались ~2.5 ГБ до конца прогона.
+        """
+        if self._engine is None:
+            return
         self._engine = None
+        gc.collect()
+        try:
+            import paddle  # noqa: PLC0415
+        except ImportError:  # pragma: no cover — модель без paddle не грузится
+            return
+        if paddle.device.is_compiled_with_cuda():  # pragma: no cover — CUDA
+            paddle.device.cuda.empty_cache()
