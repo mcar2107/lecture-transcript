@@ -39,6 +39,9 @@ _INSTALL_HINT = (
 #: (`pix2tex.model.checkpoints.get_latest_checkpoint`, тег зашит как v0.0.1).
 _WEIGHTS_URL = "https://github.com/lukas-blecher/LaTeX-OCR/releases/download/v0.0.1/{name}"
 _WEIGHTS_FILES = ("weights.pth", "image_resizer.pth")
+#: Таймаут на одну операцию сокета (не на весь файл): подвисшее соединение
+#: даёт ошибку, а не бесконечный прогрев.
+_DOWNLOAD_TIMEOUT_S = 60
 
 
 def cache_weights_dir() -> Path:
@@ -67,10 +70,15 @@ def local_weights_dirs() -> tuple[Path, ...]:
 
 
 def find_weights_dir() -> Path | None:
-    """Первый каталог с основным чекпойнтом — проверка без сети (задача 4.9)."""
+    """Первый каталог со всеми чекпойнтами — проверка без сети (задача 4.9).
+
+    Нужны оба файла: без `image_resizer.pth` `LatexOCR` молча пропускает
+    ресайзер, и распознавание формул деградирует без единого предупреждения
+    (так бывает после загрузки, оборванной между двумя файлами).
+    """
     for path in local_weights_dirs():
         try:
-            if (path / "weights.pth").is_file():
+            if all((path / name).is_file() for name in _WEIGHTS_FILES):
                 return path
         except OSError:  # pragma: no cover — недоступный каталог
             continue
@@ -91,7 +99,8 @@ def download_weights(target: Path) -> Path:
         if final.is_file():
             continue
         partial = final.with_name(name + ".part")
-        with urllib.request.urlopen(_WEIGHTS_URL.format(name=name)) as source, partial.open(
+        url = _WEIGHTS_URL.format(name=name)
+        with urllib.request.urlopen(url, timeout=_DOWNLOAD_TIMEOUT_S) as source, partial.open(
             "wb"
         ) as output:
             while chunk := source.read(1 << 20):
