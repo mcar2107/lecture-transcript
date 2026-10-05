@@ -24,6 +24,7 @@ from lecture_transcript.contracts import (
 from lecture_transcript.slide_ocr import HybridBackend, PaddleTextBackend, Pix2TexBackend, VlmBackend
 from lecture_transcript.slide_ocr.assemble import assemble_slide_ocr
 from lecture_transcript.slide_ocr.paddle_backend import parse_paddle_output
+from lecture_transcript.slide_ocr import pix2tex_backend
 from lecture_transcript.slide_ocr.pix2tex_backend import latex_to_markdown
 from lecture_transcript.slide_ocr.vlm_backend import parse_vlm_markdown
 
@@ -616,6 +617,11 @@ class _FakePaddleOCR320:
         **kwargs,
     ):
         self.params = {"lang": lang, "use_textline_orientation": use_textline_orientation}
+        self.models = {
+            name: value
+            for name, value in locals().items()
+            if name.endswith(("_model_name", "_model_dir")) and value is not None
+        }
         for name, value in kwargs.items():
             if name in self._DEPRECATED:
                 self.params[self._DEPRECATED[name]] = value
@@ -674,6 +680,7 @@ def test_paddle_бэкенд_работает_с_api_paddleocr_3_2_0(monkeypatch
     # show_log в 3.2.0 роняет конструктор: ValueError: Unknown argument.
     _FakePaddleOCR320.instances.clear()
     _install_fake_paddleocr(monkeypatch, _FakePaddleOCR320)
+    monkeypatch.setenv("PADDLE_PDX_CACHE_HOME", str(tmp_path / "empty-cache"))
 
     fragments = PaddleTextBackend().recognize(_slide_png(tmp_path))
 
@@ -681,6 +688,69 @@ def test_paddle_бэкенд_работает_с_api_paddleocr_3_2_0(monkeypatch
     assert fragments[0].bbox == Rect(x=5, y=5, width=100, height=40)
     engine = _FakePaddleOCR320.instances[-1]
     assert engine.params == {"lang": "ru", "use_textline_orientation": True}
+    assert engine.models == {}, "моделей в кэше нет — их выбирает и качает PaddleX"
+
+
+def _cache_paddle_models(root: Path, *names: str) -> None:
+    for name in names:
+        (root / "official_models" / name).mkdir(parents=True)
+        (root / "official_models" / name / "inference.yml").write_text(
+            f"Global:\n  model_name: {name}\n", encoding="utf-8"
+        )
+
+
+_ALL_RU_MODELS = (
+    "PP-LCNet_x1_0_doc_ori",
+    "UVDoc",
+    "PP-LCNet_x1_0_textline_ori",
+    "PP-OCRv5_server_det",
+    "eslav_PP-OCRv5_mobile_rec",
+)
+
+
+def test_paddle_бэкенд_берёт_скачанные_модели_с_диска(monkeypatch, tmp_path: Path):
+    # PaddleX 3.2.0 без явного *_model_dir идёт к хостингу моделей даже за
+    # скачанной моделью и без сети падает: «No available model hosting platforms».
+    _FakePaddleOCR320.instances.clear()
+    _install_fake_paddleocr(monkeypatch, _FakePaddleOCR320)
+    cache = tmp_path / "paddlex"
+    _cache_paddle_models(cache, *_ALL_RU_MODELS)
+    monkeypatch.setenv("PADDLE_PDX_CACHE_HOME", str(cache))
+
+    PaddleTextBackend().recognize(_slide_png(tmp_path))
+
+    engine = _FakePaddleOCR320.instances[-1]
+    models = cache / "official_models"
+    assert engine.models == {
+        "doc_orientation_classify_model_name": "PP-LCNet_x1_0_doc_ori",
+        "doc_orientation_classify_model_dir": str(models / "PP-LCNet_x1_0_doc_ori"),
+        "doc_unwarping_model_name": "UVDoc",
+        "doc_unwarping_model_dir": str(models / "UVDoc"),
+        "textline_orientation_model_name": "PP-LCNet_x1_0_textline_ori",
+        "textline_orientation_model_dir": str(models / "PP-LCNet_x1_0_textline_ori"),
+        "text_detection_model_name": "PP-OCRv5_server_det",
+        "text_detection_model_dir": str(models / "PP-OCRv5_server_det"),
+        "text_recognition_model_name": "eslav_PP-OCRv5_mobile_rec",
+        "text_recognition_model_dir": str(models / "eslav_PP-OCRv5_mobile_rec"),
+    }
+    # модели текста заданы явно — lang не передаётся, PaddleOCR его бы проигнорировал
+    assert engine.params["lang"] is None
+
+
+def test_paddle_бэкенд_не_задаёт_детекцию_без_распознавания(monkeypatch, tmp_path: Path):
+    # Заданная детекция отключает выбор моделей по lang: без пары распознавание
+    # осталось бы без русской модели.
+    _FakePaddleOCR320.instances.clear()
+    _install_fake_paddleocr(monkeypatch, _FakePaddleOCR320)
+    cache = tmp_path / "paddlex"
+    _cache_paddle_models(cache, "PP-OCRv5_server_det", "UVDoc")
+    monkeypatch.setenv("PADDLE_PDX_CACHE_HOME", str(cache))
+
+    PaddleTextBackend().recognize(_slide_png(tmp_path))
+
+    engine = _FakePaddleOCR320.instances[-1]
+    assert set(engine.models) == {"doc_unwarping_model_name", "doc_unwarping_model_dir"}
+    assert engine.params["lang"] == "ru"
 
 
 def test_paddle_бэкенд_по_прежнему_работает_с_api_paddleocr_2x(monkeypatch, tmp_path: Path):
@@ -689,11 +759,18 @@ def test_paddle_бэкенд_по_прежнему_работает_с_api_paddl
     assert [f.text for f in fragments] == ["Пример 2."]
 
 
-def test_pix2tex_сообщает_об_отсутствии_весов_до_прогона(monkeypatch, tmp_path: Path):
+def _pretend_pix2tex(monkeypatch, tmp_path: Path) -> tuple[Path, Path]:
+    """pix2tex «установлен» в tmp_path; кэш моделей тоже там. -> (пакет, кэш)."""
     package = tmp_path / "pix2tex"
     package.mkdir()
     spec = types.SimpleNamespace(submodule_search_locations=[str(package)])
     _pretend_installed(monkeypatch, {"pix2tex": spec, "torch": object()})
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    return package, tmp_path / "cache" / "pix2tex"
+
+
+def test_pix2tex_сообщает_об_отсутствии_весов_до_прогона(monkeypatch, tmp_path: Path):
+    package, _ = _pretend_pix2tex(monkeypatch, tmp_path)
 
     availability = Pix2TexBackend().check_availability()
     assert availability.available is False
@@ -703,6 +780,58 @@ def test_pix2tex_сообщает_об_отсутствии_весов_до_пр
     checkpoints.mkdir(parents=True)
     (checkpoints / "weights.pth").write_bytes(b"x")
     assert Pix2TexBackend().check_availability().available is True
+
+
+def test_pix2tex_находит_веса_в_кэше_моделей(monkeypatch, tmp_path: Path):
+    # В образе это /cache/pix2tex на томе: веса в пакете живут только
+    # до конца `docker compose run --rm`.
+    _, cache = _pretend_pix2tex(monkeypatch, tmp_path)
+    cache.mkdir(parents=True)
+    (cache / "weights.pth").write_bytes(b"x")
+    assert Pix2TexBackend().check_availability().available is True
+    assert pix2tex_backend.find_weights_dir() == cache
+
+
+def test_pix2tex_грузит_модель_из_кэша_и_качает_туда(monkeypatch, tmp_path: Path):
+    _, cache = _pretend_pix2tex(monkeypatch, tmp_path)
+    downloads: list[Path] = []
+
+    def fake_download(target: Path) -> Path:
+        downloads.append(target)
+        target.mkdir(parents=True)
+        (target / "weights.pth").write_bytes(b"x")
+        return target
+
+    created: list[Any] = []
+
+    class FakeLatexOCR:
+        def __init__(self, arguments=None):
+            created.append(arguments)
+
+        def __call__(self, image):
+            return r"x = a + b"
+
+    cli = types.ModuleType("pix2tex.cli")
+    cli.LatexOCR = FakeLatexOCR  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "pix2tex", types.ModuleType("pix2tex"))
+    monkeypatch.setitem(sys.modules, "pix2tex.cli", cli)
+    monkeypatch.setattr(pix2tex_backend, "download_weights", fake_download)
+    monkeypatch.setattr("lecture_transcript.slide_ocr.offline.enforce_offline", lambda: {})
+
+    image = Image.new("RGB", (40, 20), "white")
+    ImageDraw.Draw(image).line((2, 10, 38, 10), fill="black")
+    assert Pix2TexBackend().latex_from_image(image) == "x = a + b"
+
+    assert downloads == [cache]
+    assert created[0].checkpoint == str(cache / "weights.pth")
+
+
+def test_pix2tex_не_отдаёт_модели_однотонную_картинку(monkeypatch):
+    # pix2tex делит на (max - min) и падает на cv2.cvtColor(!_src.empty()).
+    backend = Pix2TexBackend()
+    monkeypatch.setattr(backend, "_load", lambda: pytest.fail("модель не должна грузиться"))
+    assert backend.latex_from_image(Image.new("RGB", (64, 32), "white")) == ""
+    assert backend.latex_from_image(Image.new("L", (64, 32), 0)) == ""
 
 
 def _fake_torch(free_gb: float, total_gb: float) -> types.ModuleType:

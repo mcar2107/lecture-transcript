@@ -4,7 +4,7 @@
 тянутся, их отсутствие даёт честную ошибку. Значит, веса нужно один раз
 скачать заранее — это и делает прогрев:
 
-1. снимает офлайн-режим на время прогрева;
+1. снимает офлайн-режим на время прогрева (переключатели `*_OFFLINE=0`);
 2. по очереди загружает модели бэкендов их же собственными загрузчиками и
    сразу выгружает каждую (design D7: одна модель в памяти за раз);
 3. возвращает окружение как было и в явно включённом офлайн-режиме
@@ -14,7 +14,9 @@
 
 Публичного «загрузить модель без распознавания» пакеты не дают, поэтому
 модель поднимается минимальным фиктивным вызовом на синтетическом входе:
-пустой PNG для OCR, секунда тишины для ASR и VAD, два слова для пунктуатора.
+PNG с короткой формулой для OCR, секунда тишины для ASR и VAD, два слова
+для пунктуатора. Картинка намеренно не однотонная: pix2tex на однотонной
+падает в собственной нормализации, а бэкенд такую и вовсе не отдаёт модели.
 
 Каталоги кэша моделей warmup не выбирает: их задаёт окружение образа
 (`HF_HOME`, `TORCH_HOME`, `PADDLE_PDX_CACHE_HOME`, `XDG_CACHE_HOME`).
@@ -36,7 +38,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from .config import ConfigError, PipelineConfig, load_config
-from .contracts import AudioArtifact, Availability, PipelineError, SpeechInterval, Word
+from .contracts import AudioArtifact, Availability, PipelineError, SpeechInterval
 from .logging_setup import LOG_LEVELS, format_duration, setup_logging
 
 __all__ = [
@@ -121,6 +123,14 @@ def _is_offline_switch(name: str) -> bool:
     return name.endswith("_OFFLINE")
 
 
+#: Значение переключателя `*_OFFLINE` в окне прогрева. Именно "0", а не
+#: удалённая переменная: бэкенды при загрузке зовут `enforce_offline()`,
+#: который заполняет ПУСТЫЕ переключатели единицей. Без явного "0" первый же
+#: OCR-бэкенд включил бы офлайн обратно, и все модели после него грелись бы
+#: уже без сети (а huggingface_hub ещё и запомнил бы это на импорте).
+_ONLINE_VALUE = "0"
+
+
 def _snapshot(keys: Sequence[str]) -> dict[str, str | None]:
     return {key: os.environ.get(key) for key in keys}
 
@@ -135,16 +145,13 @@ def _restore(saved: Mapping[str, str | None]) -> None:
 
 @contextmanager
 def online_window(env_spec: Mapping[str, str]) -> Iterator[None]:
-    """Окно прогрева: переключатели `*_OFFLINE` сняты, запреты телеметрии и
-    проверки обновлений включены. На выходе окружение восстанавливается
-    ровно таким, каким было, — при любом исходе."""
+    """Окно прогрева: переключатели `*_OFFLINE` явно выключены ("0"), запреты
+    телеметрии и проверки обновлений включены. На выходе окружение
+    восстанавливается ровно таким, каким было, — при любом исходе."""
     saved = _snapshot(list(env_spec))
     try:
         for key, value in env_spec.items():
-            if _is_offline_switch(key):
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
+            os.environ[key] = _ONLINE_VALUE if _is_offline_switch(key) else value
         yield
     finally:
         _restore(saved)
@@ -219,8 +226,8 @@ def _warm_ocr(backend: Any, inputs: WarmInputs) -> None:
     text = getattr(backend, "text_backend", None)
     formula = getattr(backend, "formula_backend", None)
     if text is not None and formula is not None:
-        # Гибрид: на пустом изображении роутер не отдаст ни строки в формулы,
-        # и pix2tex не загрузится — поэтому поднимаем обе части явно.
+        # Гибрид: роутер может не счесть пробную строку формульной, и тогда
+        # pix2tex не загрузится — поэтому поднимаем обе части явно.
         text.recognize(inputs.image_path)
         formula.latex_from_image(inputs.image())
         return
@@ -235,7 +242,7 @@ def _ocr_target(name: str) -> WarmTarget:
 
     return WarmTarget(
         "ocr", name, load, _warm_ocr,
-        note="recognize() пустого PNG 64x32; у hybrid — обе части по отдельности",
+        note="recognize() PNG с формулой; у hybrid — обе части по отдельности",
     )
 
 
@@ -286,15 +293,14 @@ def _punctuation_target() -> WarmTarget:
         return get_punctuator()
 
     def warm(punctuator: Any, inputs: WarmInputs) -> None:
-        from .speech_transcription import restore_punctuation  # noqa: PLC0415
+        # Не restore_punctuation(): стадия глотает ошибки модели (прогон не
+        # должен падать из-за пунктуации), и несостоявшаяся загрузка весов
+        # выглядела бы как успешный прогрев. Здесь отказ обязан быть громким.
+        raw = "проверка связи"
+        if punctuator.restore(raw).strip() == raw:
+            raise RuntimeError("пунктуатор вернул текст без изменений — модель не отработала")
 
-        restore_punctuation(
-            [Word("проверка", 0.0, 0.4), Word("связи", 0.4, 0.8)], punctuator
-        )
-
-    return WarmTarget(
-        "punctuation", "default", load, warm, note="restore_punctuation() двух слов"
-    )
+    return WarmTarget("punctuation", "default", load, warm, note="restore() двух слов")
 
 
 def plan_targets(
@@ -345,11 +351,14 @@ def plan_targets(
 
 
 def _make_inputs(workdir: Path) -> WarmInputs:
-    from PIL import Image  # noqa: PLC0415
+    from PIL import Image, ImageDraw  # noqa: PLC0415
 
     workdir.mkdir(parents=True, exist_ok=True)
-    image_path = workdir / "blank.png"
-    Image.new("RGB", (64, 32), (255, 255, 255)).save(image_path)
+    image_path = workdir / "formula.png"
+    image = Image.new("RGB", (160, 48), (255, 255, 255))
+    # Встроенный растровый шрифт PIL: файлы шрифтов в образе не нужны.
+    ImageDraw.Draw(image).text((8, 16), "x = a + b", fill=(0, 0, 0))
+    image.save(image_path)
 
     wav_path = workdir / "silence.wav"
     with wave.open(str(wav_path), "wb") as wav:

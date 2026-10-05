@@ -729,9 +729,10 @@ def test_default_punctuator_reason_names_real_install_source():
     """Причина недоступности обязана вести туда, где пакет реально лежит."""
     from lecture_transcript.speech_transcription.punctuation import SbertPuncCaseRu
 
+    if importlib.util.find_spec("sbert_punc_case_ru") is not None:  # pragma: no cover
+        # в образе пакет стоит; без весов в офлайне причина будет про веса
+        pytest.skip("пакет пунктуатора установлен")
     availability = SbertPuncCaseRu().check_availability()
-    if availability.available:  # pragma: no cover — на машине разработки весов нет
-        pytest.skip("пунктуатор установлен")
     # `pip install sbert_punc_case_ru` не работает: пакета нет на PyPI.
     assert "huggingface.co/kontur-ai/sbert_punc_case_ru" in availability.reason
 
@@ -1363,6 +1364,69 @@ def test_gigaam_runs_without_glossary_with_degradation_warning(audio, energy_con
     assert result.words
     assert result.used_glossary is False
     assert any("не поддерживает глоссарий" in w for w in result.warnings)
+
+
+def _pretend_packages(monkeypatch, *names: str) -> None:
+    real = importlib.util.find_spec
+    monkeypatch.setattr(
+        importlib.util,
+        "find_spec",
+        lambda name, *a, **kw: object() if name in names else real(name, *a, **kw),
+    )
+
+
+def test_gigaam_offline_without_weights_is_unavailable(monkeypatch, tmp_path):
+    """gigaam качает с CDN Сбера мимо HF: HF_HUB_OFFLINE его не остановит,
+    поэтому отсутствие весов в офлайне ловится до прогона."""
+    _pretend_packages(monkeypatch, "torch", "gigaam")
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+
+    with offline_mode():
+        availability = GigaAmBackend().check_availability()
+    assert availability.available is False
+    assert str(tmp_path / "gigaam" / "v2_rnnt.ckpt") in availability.reason
+
+    # онлайн (окно прогрева) — доступен: веса докачаются при загрузке
+    monkeypatch.setenv("HF_HUB_OFFLINE", "0")
+    assert GigaAmBackend().check_availability().available is True
+
+    (tmp_path / "gigaam").mkdir()
+    (tmp_path / "gigaam" / "v2_rnnt.ckpt").write_bytes(b"x")
+    with offline_mode():
+        assert GigaAmBackend().check_availability().available is True
+
+
+def test_gigaam_downloads_into_model_cache(monkeypatch, tmp_path):
+    """По умолчанию gigaam пишет в ~/.cache/gigaam — в контейнере это слой,
+    который `run --rm` выбрасывает. Каталог обязан идти из XDG_CACHE_HOME."""
+    import types
+
+    calls: list[dict] = []
+    fake = types.ModuleType("gigaam")
+    fake.load_model = lambda name, **kwargs: calls.append(kwargs) or _ModelWithoutHotwords()
+    monkeypatch.setitem(sys.modules, "gigaam", fake)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+
+    GigaAmBackend()._prepare(SAMPLE_RATE)  # noqa: SLF001
+    assert calls == [{"download_root": str(tmp_path / "gigaam")}]
+
+
+def test_punctuator_offline_without_weights_is_unavailable(monkeypatch, tmp_path):
+    _pretend_packages(monkeypatch, "torch", "transformers", "sbert_punc_case_ru")
+    monkeypatch.setenv("HF_HOME", str(tmp_path))
+    for variable in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
+        monkeypatch.delenv(variable, raising=False)
+
+    with offline_mode():
+        availability = SbertPuncCaseRu().check_availability()
+    assert availability.available is False
+    assert "kontur-ai/sbert_punc_case_ru" in availability.reason
+    assert "warmup" in availability.reason
+
+    snapshot = tmp_path / "hub" / "models--kontur-ai--sbert_punc_case_ru" / "snapshots" / "f778dc6"
+    snapshot.mkdir(parents=True)
+    with offline_mode():
+        assert SbertPuncCaseRu().check_availability().available is True
 
 
 def test_used_glossary_false_when_nothing_was_recognized(audio):

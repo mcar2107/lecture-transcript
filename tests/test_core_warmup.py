@@ -95,15 +95,46 @@ def test_offline_lifted_during_warmup_and_restored_after(
 
     results = warmup.run_warmup(lambda: [fake_target(backend)], tmp_path)
 
-    # во время прогрева все переключатели *_OFFLINE сняты
+    # во время прогрева все переключатели *_OFFLINE явно выключены
     for key in SPEC:
         if key.endswith("_OFFLINE"):
-            assert backend.env_at_warm[key] is None, f"{key} не снят на время прогрева"
+            assert backend.env_at_warm[key] == "0", f"{key} не снят на время прогрева"
     # а гигиена (телеметрия и т. п.) осталась включённой
     assert backend.env_at_warm["HF_HUB_DISABLE_TELEMETRY"] == "1"
     # после прогрева окружение ровно как было
     assert {k: os.environ.get(k) for k in SPEC} == before
     assert results[0].ok
+
+
+def test_backend_enforce_offline_does_not_end_warmup_window(
+    tmp_path: Path, offline_env_set: dict[str, str]
+) -> None:
+    """Pix2TexBackend._load() зовёт enforce_offline(): раньше это возвращало
+    HF_HUB_OFFLINE=1 посреди прогрева, и следующие модели не скачивались."""
+    from lecture_transcript.slide_ocr.offline import enforce_offline
+    from lecture_transcript.speech_transcription.offline import is_offline
+
+    events: list[str] = []
+    first, second = FakeBackend("ocr", events), FakeBackend("asr", events)
+    offline_seen: list[bool] = []
+
+    def warm_ocr(obj, inputs):
+        enforce_offline()
+        obj.warm()
+
+    def warm_asr(obj, inputs):
+        offline_seen.append(is_offline())
+        obj.warm()
+
+    warmup.run_warmup(
+        lambda: [
+            warmup.WarmTarget("fake", "ocr", lambda: first, warm_ocr),
+            warmup.WarmTarget("fake", "asr", lambda: second, warm_asr),
+        ],
+        tmp_path,
+    )
+    assert offline_seen == [False]
+    assert second.env_at_warm["HF_HUB_OFFLINE"] == "0"
 
 
 def test_environment_restored_even_when_warmup_explodes(
@@ -249,7 +280,7 @@ def test_plan_all_skips_vlm_unless_asked() -> None:
 
 
 def test_hybrid_warms_both_text_and_formula_parts(tmp_path: Path) -> None:
-    """На пустой картинке гибрид не позвал бы pix2tex — греем обе части явно."""
+    """Роутер мог бы не позвать pix2tex на пробной строке — греем обе части явно."""
     calls: list[str] = []
 
     class Text:
@@ -266,7 +297,63 @@ def test_hybrid_warms_both_text_and_formula_parts(tmp_path: Path) -> None:
 
     inputs = warmup._make_inputs(tmp_path)  # noqa: SLF001
     warmup._warm_ocr(Hybrid(), inputs)  # noqa: SLF001
-    assert calls == ["text", "formula:(64, 32)"]
+    assert calls == ["text", "formula:(160, 48)"]
+
+
+def test_warm_image_is_not_blank(tmp_path: Path) -> None:
+    """На однотонной картинке pix2tex падает (cvtColor !_src.empty()), а бэкенд
+    такую модели и не отдаёт — прогрев не загрузил бы веса."""
+    from lecture_transcript.slide_ocr.pix2tex_backend import _is_blank
+
+    inputs = warmup._make_inputs(tmp_path)  # noqa: SLF001
+    assert not _is_blank(inputs.image())
+
+
+class _Punctuator:
+    def __init__(self, restore) -> None:
+        self.restore = restore
+
+    def check_availability(self) -> Availability:
+        return Availability(True)
+
+    def unload(self) -> None:
+        pass
+
+
+def _hub_unreachable(text: str) -> str:
+    raise OSError("huggingface.co недоступен")
+
+
+@pytest.mark.parametrize(
+    "restore, error",
+    [
+        (_hub_unreachable, "OSError: huggingface.co недоступен"),
+        (lambda text: text, "без изменений"),
+    ],
+    ids=["модель-упала", "текст-без-изменений"],
+)
+def test_punctuation_warmup_fails_loudly(
+    tmp_path: Path, offline_env_set: dict[str, str], monkeypatch: pytest.MonkeyPatch,
+    restore, error: str,
+) -> None:
+    """restore_punctuation() глотает ошибки модели; прогрев так делать не должен."""
+    from lecture_transcript import speech_transcription
+
+    monkeypatch.setattr(speech_transcription, "get_punctuator", lambda: _Punctuator(restore))
+    results = warmup.run_warmup(lambda: [warmup._punctuation_target()], tmp_path)  # noqa: SLF001
+    assert not results[0].loaded
+    assert error in results[0].error
+
+
+def test_punctuation_warmup_ok_when_model_punctuates(
+    tmp_path: Path, offline_env_set: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from lecture_transcript import speech_transcription
+
+    punctuator = _Punctuator(lambda text: "Проверка связи.")
+    monkeypatch.setattr(speech_transcription, "get_punctuator", lambda: punctuator)
+    results = warmup.run_warmup(lambda: [warmup._punctuation_target()], tmp_path)  # noqa: SLF001
+    assert results[0].ok
 
 
 # --------------------------------------------------------------------------

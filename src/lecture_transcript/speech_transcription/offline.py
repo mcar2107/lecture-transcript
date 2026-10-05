@@ -15,8 +15,15 @@ from __future__ import annotations
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 
-__all__ = ["OFFLINE_ENV", "enable_offline_mode", "offline_mode", "is_offline"]
+__all__ = [
+    "OFFLINE_ENV",
+    "enable_offline_mode",
+    "offline_mode",
+    "is_offline",
+    "hf_model_cached",
+]
 
 #: Переменные, переводящие библиотеки моделей в офлайн.
 OFFLINE_ENV: dict[str, str] = {
@@ -45,6 +52,28 @@ def enable_offline_mode(env: dict[str, str] | None = None) -> dict[str, str | No
 def is_offline() -> bool:
     """Включён ли офлайн-режим для библиотек Hugging Face."""
     return os.environ.get("HF_HUB_OFFLINE", "") not in ("", "0", "false", "False")
+
+
+def hf_model_cached(model_id: str) -> bool:
+    """Лежит ли модель Hugging Face в локальном кэше хаба — проверка без сети.
+
+    Каталог кэша разрешается так же, как в ``huggingface_hub``:
+    ``HF_HUB_CACHE`` > ``HUGGINGFACE_HUB_CACHE`` > ``$HF_HOME/hub`` >
+    ``~/.cache/huggingface/hub``.
+    """
+    cache = os.environ.get("HF_HUB_CACHE") or os.environ.get("HUGGINGFACE_HUB_CACHE")
+    if not cache:
+        hf_home = os.environ.get("HF_HOME")
+        cache = (
+            str(Path(hf_home) / "hub")
+            if hf_home
+            else str(Path.home() / ".cache" / "huggingface" / "hub")
+        )
+    snapshots = Path(cache) / ("models--" + model_id.replace("/", "--")) / "snapshots"
+    try:
+        return any(snapshots.iterdir())
+    except OSError:
+        return False
 
 
 @contextmanager
