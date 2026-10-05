@@ -773,6 +773,21 @@ def _pretend_pix2tex(monkeypatch, tmp_path: Path) -> tuple[Path, Path]:
     return package, tmp_path / "cache" / "pix2tex"
 
 
+def _write_pix2tex_weights(directory: Path, names=("weights.pth", "image_resizer.pth")) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        (directory / name).write_bytes(b"x")
+
+
+def test_pix2tex_без_ресайзера_веса_не_считаются_скачанными(monkeypatch, tmp_path: Path):
+    # Загрузка оборвалась между файлами: LatexOCR молча работал бы без
+    # ресайзера, а проверка и прогрев показывали бы OK.
+    _, cache = _pretend_pix2tex(monkeypatch, tmp_path)
+    _write_pix2tex_weights(cache, names=("weights.pth",))
+    availability = Pix2TexBackend().check_availability()
+    assert availability.available is False and "вес" in availability.reason
+
+
 def test_pix2tex_сообщает_об_отсутствии_весов_до_прогона(monkeypatch, tmp_path: Path):
     package, _ = _pretend_pix2tex(monkeypatch, tmp_path)
 
@@ -782,7 +797,7 @@ def test_pix2tex_сообщает_об_отсутствии_весов_до_пр
 
     checkpoints = package / "model" / "checkpoints"
     checkpoints.mkdir(parents=True)
-    (checkpoints / "weights.pth").write_bytes(b"x")
+    _write_pix2tex_weights(checkpoints)
     assert Pix2TexBackend().check_availability().available is True
 
 
@@ -790,8 +805,7 @@ def test_pix2tex_находит_веса_в_кэше_моделей(monkeypatch,
     # В образе это /cache/pix2tex на томе: веса в пакете живут только
     # до конца `docker compose run --rm`.
     _, cache = _pretend_pix2tex(monkeypatch, tmp_path)
-    cache.mkdir(parents=True)
-    (cache / "weights.pth").write_bytes(b"x")
+    _write_pix2tex_weights(cache)
     assert Pix2TexBackend().check_availability().available is True
     assert pix2tex_backend.find_weights_dir() == cache
 
@@ -802,8 +816,7 @@ def test_pix2tex_грузит_модель_из_кэша_и_качает_туд�
 
     def fake_download(target: Path) -> Path:
         downloads.append(target)
-        target.mkdir(parents=True)
-        (target / "weights.pth").write_bytes(b"x")
+        _write_pix2tex_weights(target)
         return target
 
     created: list[Any] = []
@@ -1003,3 +1016,19 @@ def test_печатная_формула_распознана_в_коррект�
         assert body.count("{") == body.count("}")  # LaTeX рендерится
         assert body.count("(") == body.count(")")
     assert any("Пример" in fragment.text for fragment in fragments if fragment.kind == "text")
+
+
+def test_pix2tex_загрузка_весов_не_висит_бесконечно(monkeypatch, tmp_path: Path):
+    import io
+
+    timeouts: list[float | None] = []
+
+    def fake_urlopen(url, timeout=None):
+        timeouts.append(timeout)
+        return io.BytesIO(b"weights")
+
+    monkeypatch.setattr(pix2tex_backend.urllib.request, "urlopen", fake_urlopen)
+    target = pix2tex_backend.download_weights(tmp_path / "pix2tex")
+
+    assert timeouts and all(t is not None and t > 0 for t in timeouts)
+    assert sorted(p.name for p in target.iterdir()) == ["image_resizer.pth", "weights.pth"]
