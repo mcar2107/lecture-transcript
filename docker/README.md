@@ -74,7 +74,29 @@ LECTURE_INPUT_DIR=/mnt/d/lectures LECTURE_OUTPUT_DIR=./out \
 ```
 
 Веса моделей качаются в `/cache` (именованный том `model-cache`) — пересборка
-образа не приводит к повторной выкачке нескольких гигабайт.
+образа не приводит к повторной выкачке нескольких гигабайт. Раскладка после
+прогрева конфигурации по умолчанию (~1.5 ГБ):
+
+| Каталог | Модель | Откуда качается |
+|---|---|---|
+| `/cache/paddlex/official_models` | PaddleOCR (5 моделей, ~140 МБ) | `huggingface.co`, при отказе — `modelscope.cn` |
+| `/cache/pix2tex` | pix2tex (~115 МБ) | `github.com` (релиз LaTeX-OCR v0.0.1) |
+| `/cache/gigaam` | GigaAM-v2 RNNT (~450 МБ) | `cdn.chatwm.opensmodel.sberdevices.ru` |
+| `/cache/huggingface` | пунктуатор `kontur-ai/sbert_punc_case_ru` (~820 МБ) | `huggingface.co` |
+
+silero-vad весов не качает: модель лежит внутри pip-пакета. pix2tex и GigaAM
+сами по умолчанию пишут веса внутрь контейнера (каталог пакета и `~/.cache`),
+и при `run --rm` они пропадают. Поэтому бэкенды явно передают им каталоги
+внутри `$XDG_CACHE_HOME`. PaddleX 3.2.0 даже за скачанной моделью идёт к хостингу и
+без сети падает, поэтому бэкенд передаёт PaddleOCR каталоги моделей из кэша
+(`*_model_dir`). Сообщение «No model hoster is available» при прогоне без сети
+безвредно: это проверка хостингов при импорте PaddleX.
+
+**Сеть для сборки и прогрева.** Сборка: `download.pytorch.org`, `pypi.org`,
+`huggingface.co` (git-зависимость пунктуатора), `www.paddlepaddle.org.cn` и
+`paddle-whl.cdn.bcebos.com` (колесо Paddle). Прогрев: хосты из таблицы выше.
+Китайские хосты через VPN могут не открываться: сборка тогда виснет на шаге
+с Paddle до таймаута.
 
 **Прогрев кэша.** По умолчанию сервис запускается с `HF_HUB_OFFLINE=1`: задачи
 4.9 и 5.8 требуют прогона без сети, и при отсутствии весов нужна внятная ошибка,
@@ -82,7 +104,18 @@ LECTURE_INPUT_DIR=/mnt/d/lectures LECTURE_OUTPUT_DIR=./out \
 кэш пуст, делается с явным переопределением:
 
 ```bash
-HF_HUB_OFFLINE=0 docker compose -f docker/compose.yaml run --rm lecture-transcript ...
+HF_HUB_OFFLINE=0 docker compose -f docker/compose.yaml run --rm lecture-transcript \
+    python -m lecture_transcript.warmup
+```
+
+Проверить, что прогретого кэша хватает для работы без сети, можно прогревом в
+контейнере с отключённой сетью. Он должен завершиться с кодом 0:
+
+```bash
+docker run --rm --gpus all --network none --shm-size 2g \
+    -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,video -e HF_HUB_OFFLINE=1 \
+    -v "$PWD":/app -v lecture-transcript_model-cache:/cache \
+    lecture-transcript:0.1.0 python -m lecture_transcript.warmup
 ```
 
 `verify_env.sh` сети не требует: он только импортирует пакеты, веса не грузит.

@@ -64,6 +64,58 @@ def paddleocr_init_kwargs(engine_cls: Any, lang: str) -> dict[str, Any]:
     return {"lang": lang, "use_angle_cls": True, "show_log": False}
 
 
+#: Вспомогательные модели конвейера OCR PaddleOCR 3.x: от языка не зависят
+#: (сверено по колесу paddlex 3.2.0, `configs/pipelines/OCR.yaml`).
+_AUX_MODELS: dict[str, str] = {
+    "doc_orientation_classify": "PP-LCNet_x1_0_doc_ori",
+    "doc_unwarping": "UVDoc",
+    "textline_orientation": "PP-LCNet_x1_0_textline_ori",
+}
+
+#: Детекция и распознавание по языку — как их выбирает
+#: `PaddleOCR._get_ocr_model_names` в paddleocr 3.2.0 (PP-OCRv5).
+_TEXT_MODELS: dict[str, tuple[str, str]] = {
+    "ru": ("PP-OCRv5_server_det", "eslav_PP-OCRv5_mobile_rec"),
+}
+
+
+def local_model_kwargs(lang: str) -> dict[str, str]:
+    """Имена и каталоги уже скачанных моделей — аргументы `PaddleOCR` 3.x.
+
+    PaddleX 3.2.0 берёт официальную модель только через хостинг
+    (`official_models[name]`): даже скачанную он заново сверяет с
+    HuggingFace/ModelScope, а без сети падает с «No available model hosting
+    platforms detected». Явный `*_model_dir` этот путь обходит — модель
+    грузится с диска. Роли, чьей модели в кэше нет, не передаются: их
+    PaddleX скачает сам (так проходит первый прогрев).
+    """
+    root = local_weights_dirs()[0]
+
+    def cached(name: str) -> str | None:
+        path = root / name
+        return str(path) if (path / "inference.yml").is_file() else None
+
+    kwargs: dict[str, str] = {}
+    for role, name in _AUX_MODELS.items():
+        path = cached(name)
+        if path:
+            kwargs[f"{role}_model_name"] = name
+            kwargs[f"{role}_model_dir"] = path
+    det, rec = _TEXT_MODELS.get(lang, (None, None))
+    if det and rec:
+        det_path, rec_path = cached(det), cached(rec)
+        # Только парой: заданная детекция или распознавание отключает выбор
+        # моделей по `lang`, и вторая роль осталась бы без модели.
+        if det_path and rec_path:
+            kwargs.update(
+                text_detection_model_name=det,
+                text_detection_model_dir=det_path,
+                text_recognition_model_name=rec,
+                text_recognition_model_dir=rec_path,
+            )
+    return kwargs
+
+
 def has_local_weights() -> bool:
     """Есть ли локальные веса — проверка без сети (задача 4.9)."""
     for path in local_weights_dirs():
@@ -226,7 +278,14 @@ class PaddleTextBackend:
             enforce_offline()
             from paddleocr import PaddleOCR  # ленивый импорт
 
-            self._engine = PaddleOCR(**paddleocr_init_kwargs(PaddleOCR, self.lang))
+            kwargs = paddleocr_init_kwargs(PaddleOCR, self.lang)
+            if is_paddleocr_3(PaddleOCR):
+                kwargs.update(local_model_kwargs(self.lang))
+                if "text_detection_model_dir" in kwargs:
+                    # модели заданы явно — `lang` PaddleOCR проигнорирует с
+                    # предупреждением; язык уже учтён в выборе моделей
+                    kwargs.pop("lang")
+            self._engine = PaddleOCR(**kwargs)
         return self._engine
 
     def recognize(self, image_path: Path) -> Sequence[OcrFragment]:

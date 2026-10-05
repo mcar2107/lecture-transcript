@@ -12,6 +12,13 @@
 модуль импортируется нормально, а :meth:`check_availability` возвращает
 ``Availability(False, ...)`` с внятной причиной — это позволяет отвергнуть
 бэкенд до начала прогона, а не упасть ImportError на импорте пакета.
+
+Веса. ``gigaam`` по умолчанию качает их в ``~/.cache/gigaam``, игнорируя
+``XDG_CACHE_HOME``; в контейнере это слой, который ``run --rm`` выбрасывает.
+Поэтому каталог передаётся явно — ``$XDG_CACHE_HOME/gigaam`` (в образе том
+``/cache``). Качает ``gigaam`` напрямую с CDN Сбера, мимо Hugging Face, и
+``HF_HUB_OFFLINE`` его не останавливает: в офлайн-режиме отсутствие весов
+ловит :meth:`check_availability` до начала прогона.
 """
 
 from __future__ import annotations
@@ -29,8 +36,15 @@ import numpy as np
 from ..contracts import Availability, Glossary, Word
 from .audio_io import write_wav_mono
 from .base import IntervalAsrBackend
+from .offline import is_offline
 
-__all__ = ["GigaAmBackend", "GIGAAM_BACKEND_NAME", "GIGAAM_MAX_CHUNK_S"]
+__all__ = [
+    "GigaAmBackend",
+    "GIGAAM_BACKEND_NAME",
+    "GIGAAM_MAX_CHUNK_S",
+    "gigaam_cache_dir",
+    "gigaam_checkpoint_files",
+]
 
 GIGAAM_BACKEND_NAME = "gigaam-v2"
 
@@ -46,6 +60,30 @@ _INSTALL_HINT = (
     "поставьте `pip install gigaam torch` (веса ~1 ГБ качаются при первой загрузке) "
     "либо выберите другой ASR-бэкенд"
 )
+
+
+def gigaam_cache_dir() -> Path:
+    """Каталог весов GigaAM в кэше моделей (в образе — ``/cache/gigaam``)."""
+    base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    return Path(base) / "gigaam"
+
+
+def gigaam_checkpoint_files(model_name: str, root: Path) -> tuple[Path, ...]:
+    """Файлы, которые ``gigaam.load_model`` (0.1.0) берёт с диска для модели.
+
+    Повторяет разрешение имён из ``gigaam._download_model`` и
+    ``_download_tokenizer``: короткие ``ctc``/``rnnt``/``ssl`` означают v2,
+    ``emo`` — v1; отдельный токенизатор нужен только ``v1_rnnt``.
+    """
+    name = model_name
+    if name in ("ctc", "rnnt", "ssl"):
+        name = f"v2_{name}"
+    elif name == "emo":
+        name = "v1_emo"
+    files = [root / f"{name}.ckpt"]
+    if name == "v1_rnnt":
+        files.append(root / f"{name}_tokenizer.model")
+    return tuple(files)
 
 
 class GigaAmBackend(IntervalAsrBackend):
@@ -69,11 +107,25 @@ class GigaAmBackend(IntervalAsrBackend):
     # -- доступность ------------------------------------------------------
 
     def check_availability(self) -> Availability:
-        """Проверить наличие зависимостей без их импорта (find_spec не грузит модуль)."""
+        """Проверить зависимости без их импорта (find_spec не грузит модуль),
+        а в офлайн-режиме — ещё и наличие весов на диске."""
         for package in ("torch", "gigaam"):
             if importlib.util.find_spec(package) is None:
                 return Availability(
                     False, f"не установлен пакет {package!r}: {_INSTALL_HINT}"
+                )
+        if is_offline():
+            missing = [
+                path
+                for path in gigaam_checkpoint_files(self._model_name, gigaam_cache_dir())
+                if not path.is_file()
+            ]
+            if missing:
+                listed = ", ".join(str(path) for path in missing)
+                return Availability(
+                    False,
+                    f"веса GigaAM не скачаны ({listed}), а офлайн-режим включён — "
+                    "прогрейте кэш: python -m lecture_transcript.warmup",
                 )
         return Availability(True)
 
@@ -84,7 +136,7 @@ class GigaAmBackend(IntervalAsrBackend):
             return
         import gigaam  # noqa: PLC0415 — ленивый импорт тяжёлой зависимости
 
-        kwargs: dict[str, Any] = {}
+        kwargs: dict[str, Any] = {"download_root": str(gigaam_cache_dir())}
         if self._device:
             kwargs["device"] = self._device
         self._model = gigaam.load_model(self._model_name, **kwargs)

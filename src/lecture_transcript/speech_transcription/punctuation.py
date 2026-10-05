@@ -36,6 +36,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Protocol, runtime_checkable
 
 from ..contracts import Availability, BackendUnavailableError, Word
+from .offline import hf_model_cached, is_offline
 
 logger = logging.getLogger(__name__)
 
@@ -388,6 +389,10 @@ INSTALL_HINT = (
     "(веса модели пунктуации ~0.7 ГБ качаются при первой загрузке)"
 )
 
+#: Репозиторий весов; совпадает с ``sbert_punc_case_ru.sbertpunccase.MODEL_REPO``,
+#: но берётся не оттуда: импорт пакета тянет transformers.
+MODEL_REPO = "kontur-ai/sbert_punc_case_ru"
+
 
 class SbertPuncCaseRu:
     """Модель восстановления пунктуации и регистра для русского текста.
@@ -413,6 +418,14 @@ class SbertPuncCaseRu:
                     False,
                     f"не установлен пакет {package!r}: {INSTALL_HINT}",
                 )
+        # В офлайне transformers не скачает веса, и restore() упадёт на каждом
+        # куске — лучше сказать об этом до прогона.
+        if is_offline() and not hf_model_cached(MODEL_REPO):
+            return Availability(
+                False,
+                f"веса {MODEL_REPO} не скачаны, а офлайн-режим включён — "
+                "прогрейте кэш: python -m lecture_transcript.warmup",
+            )
         return Availability(True)
 
     def restore(self, text: str) -> str:
