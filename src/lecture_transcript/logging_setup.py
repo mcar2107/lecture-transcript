@@ -19,6 +19,7 @@ LOG_LEVELS: tuple[str, ...] = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 
 _FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
 _DATE_FORMAT = "%H:%M:%S"
+_PACKAGE_LOGGER = "lecture_transcript"
 
 
 def setup_logging(level: str = "INFO", *, stream=None) -> None:
@@ -36,6 +37,10 @@ def setup_logging(level: str = "INFO", *, stream=None) -> None:
         root.removeHandler(existing)
     root.addHandler(handler)
     root.setLevel(resolved)
+    # Уровень пакета задаётся отдельно от корня: библиотеки моделей меняют
+    # уровень корневого логгера при импорте (`import paddle` ставит WARNING,
+    # pix2tex — CRITICAL), и логи стадий после OCR пропадали.
+    logging.getLogger(_PACKAGE_LOGGER).setLevel(resolved)
 
 
 def format_duration(seconds: float) -> str:
