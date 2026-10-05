@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.machinery
 import importlib.util
 import inspect
 import sys
@@ -269,6 +270,23 @@ def test_слайд_с_рукописным_решением_печатное_р
     assert result.unreliable is True
     # Доступ к рукописному даёт обязательная ссылка на PNG.
     assert f"![слайд 1]({image_path.as_posix()})" in result.markdown
+
+
+def test_иконка_прочитанная_как_символ_слайд_ненадёжным_не_делает(tmp_path: Path):
+    # Значок логотипа PaddleOCR читал как «<» с уверенностью 0.27: строка
+    # отбрасывается как рукописная, но содержимым слайда она не была.
+    lines = [
+        OcrFragment(text="<", kind="text", confidence=0.27, bbox=Rect(40, 28, 21, 19)),
+        OcrFragment(text="Повторение", kind="text", confidence=0.99, bbox=Rect(137, 536, 421, 80)),
+    ]
+    backend = HybridBackend(_FakeTextBackend(lines), _FakeFormulaBackend())
+    image_path = _slide_png(tmp_path)
+
+    recognized = backend.recognize(image_path)
+    result = assemble_slide_ocr(1, image_path, recognized, backend=backend.name)
+
+    assert [f.text for f in recognized] == ["Повторение"]
+    assert result.unreliable is False
 
 
 def test_плохо_прочитанная_печатная_формула_в_pix2tex_всё_ещё_уходит(tmp_path: Path):
@@ -620,7 +638,12 @@ class _FakePaddleOCR320:
         ocr_version=None,
         **kwargs,
     ):
-        self.params = {"lang": lang, "use_textline_orientation": use_textline_orientation}
+        self.params = {
+            "lang": lang,
+            "use_doc_orientation_classify": use_doc_orientation_classify,
+            "use_doc_unwarping": use_doc_unwarping,
+            "use_textline_orientation": use_textline_orientation,
+        }
         self.models = {
             name: value
             for name, value in locals().items()
@@ -691,7 +714,14 @@ def test_paddle_бэкенд_работает_с_api_paddleocr_3_2_0(monkeypatch
     assert [f.text for f in fragments] == ["Пример 2."]
     assert fragments[0].bbox == Rect(x=5, y=5, width=100, height=40)
     engine = _FakePaddleOCR320.instances[-1]
-    assert engine.params == {"lang": "ru", "use_textline_orientation": True}
+    # предобработка документа выключена: кроп слайда ровный, а классификатор
+    # ориентации переворачивал слайды на 180°, UVDoc терял строки
+    assert engine.params == {
+        "lang": "ru",
+        "use_doc_orientation_classify": False,
+        "use_doc_unwarping": False,
+        "use_textline_orientation": True,
+    }
     assert engine.models == {}, "моделей в кэше нет — их выбирает и качает PaddleX"
 
 
@@ -725,11 +755,8 @@ def test_paddle_бэкенд_берёт_скачанные_модели_с_ди�
 
     engine = _FakePaddleOCR320.instances[-1]
     models = cache / "official_models"
+    # модели предобработки документа в кэше есть, но не передаются: она выключена
     assert engine.models == {
-        "doc_orientation_classify_model_name": "PP-LCNet_x1_0_doc_ori",
-        "doc_orientation_classify_model_dir": str(models / "PP-LCNet_x1_0_doc_ori"),
-        "doc_unwarping_model_name": "UVDoc",
-        "doc_unwarping_model_dir": str(models / "UVDoc"),
         "textline_orientation_model_name": "PP-LCNet_x1_0_textline_ori",
         "textline_orientation_model_dir": str(models / "PP-LCNet_x1_0_textline_ori"),
         "text_detection_model_name": "PP-OCRv5_server_det",
@@ -747,13 +774,16 @@ def test_paddle_бэкенд_не_задаёт_детекцию_без_расп�
     _FakePaddleOCR320.instances.clear()
     _install_fake_paddleocr(monkeypatch, _FakePaddleOCR320)
     cache = tmp_path / "paddlex"
-    _cache_paddle_models(cache, "PP-OCRv5_server_det", "UVDoc")
+    _cache_paddle_models(cache, "PP-OCRv5_server_det", "PP-LCNet_x1_0_textline_ori")
     monkeypatch.setenv("PADDLE_PDX_CACHE_HOME", str(cache))
 
     PaddleTextBackend().recognize(_slide_png(tmp_path))
 
     engine = _FakePaddleOCR320.instances[-1]
-    assert set(engine.models) == {"doc_unwarping_model_name", "doc_unwarping_model_dir"}
+    assert set(engine.models) == {
+        "textline_orientation_model_name",
+        "textline_orientation_model_dir",
+    }
     assert engine.params["lang"] == "ru"
 
 
@@ -1032,3 +1062,44 @@ def test_pix2tex_загрузка_весов_не_висит_бесконечн�
 
     assert timeouts and all(t is not None and t > 0 for t in timeouts)
     assert sorted(p.name for p in target.iterdir()) == ["image_resizer.pth", "weights.pth"]
+
+
+def _fake_module(monkeypatch, name: str, **attrs: Any) -> types.ModuleType:
+    module = types.ModuleType(name)
+    module.__spec__ = importlib.machinery.ModuleSpec(name, None)
+    for attr, value in attrs.items():
+        setattr(module, attr, value)
+    monkeypatch.setitem(sys.modules, name, module)
+    return module
+
+
+def test_paddle_выгрузка_возвращает_vram_аллокатора(monkeypatch):
+    # Без empty_cache аллокатор Paddle держал ~2.5 ГБ до конца прогона (D7).
+    freed: list[str] = []
+    cuda = types.SimpleNamespace(empty_cache=lambda: freed.append("paddle"))
+    device = types.SimpleNamespace(is_compiled_with_cuda=lambda: True, cuda=cuda)
+    _fake_module(monkeypatch, "paddle", device=device)
+    backend = PaddleTextBackend()
+    backend._engine = object()
+
+    backend.unload()
+
+    assert backend._engine is None
+    assert freed == ["paddle"]
+    backend.unload()  # повторная выгрузка — без лишнего сброса кэша
+    assert freed == ["paddle"]
+
+
+def test_pix2tex_выгрузка_возвращает_vram_аллокатора(monkeypatch):
+    freed: list[str] = []
+    cuda = types.SimpleNamespace(
+        is_available=lambda: True, empty_cache=lambda: freed.append("torch")
+    )
+    _fake_module(monkeypatch, "torch", cuda=cuda)
+    backend = Pix2TexBackend()
+    backend._model = object()
+
+    backend.unload()
+
+    assert backend._model is None
+    assert freed == ["torch"]
