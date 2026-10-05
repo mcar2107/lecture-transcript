@@ -490,12 +490,16 @@ def test_переключение_на_vlm_даёт_результат_того_
         assert f"![слайд 1]({image_path.as_posix()})" in result.markdown
 
 
-def test_vlm_бэкенд_честно_говорит_о_требованиях_к_vram():
+def test_vlm_бэкенд_честно_говорит_о_требованиях_к_vram(monkeypatch, tmp_path: Path):
+    # Окружение задаётся явно: на реальной машине причина зависела бы от того,
+    # есть ли CUDA и скачаны ли веса Qwen, а не от проверяемой ветки.
+    no_cuda = _fake_torch(free_gb=0.0, total_gb=0.0)
+    no_cuda.cuda.is_available = lambda: False  # type: ignore[attr-defined]
+    _prepare_vlm_env(monkeypatch, tmp_path, no_cuda)
+
     availability = VlmBackend().check_availability()
-    if availability.available:  # pragma: no cover — на машине с CUDA
-        pytest.skip("окружение с CUDA: ветка недоступности не проверяется")
-    assert availability.reason
-    assert any(word in availability.reason for word in ("VRAM", "не установлена", "CUDA"))
+    assert availability.available is False
+    assert "CUDA" in availability.reason and "VRAM" in availability.reason
 
 
 # --------------------------------------------------------------------------

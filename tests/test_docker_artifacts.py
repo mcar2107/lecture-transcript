@@ -261,6 +261,27 @@ exit 0
 """
 
 
+#: Утилиты, наличие которых проверяет verify_env.sh. В тестах они есть только
+#: как заглушки: внутри GPU-контейнера настоящие nvidia-smi и ffmpeg лежат в
+#: /usr/bin, и «пустое окружение» без этой изоляции видело бы их.
+_HOST_TOOLS_HIDDEN = frozenset({"nvidia-smi", "ffmpeg", "ffprobe"})
+
+
+def _system_bin(tmp_path: Path) -> Path:
+    """Копия /usr/bin и /bin из симлинков — без утилит из `_HOST_TOOLS_HIDDEN`."""
+    sysbin = tmp_path / "sysbin"
+    sysbin.mkdir(exist_ok=True)
+    for source in (Path("/usr/bin"), Path("/bin")):
+        if not source.is_dir():
+            continue
+        for tool in source.iterdir():
+            link = sysbin / tool.name
+            if tool.name in _HOST_TOOLS_HIDDEN or link.exists() or link.is_symlink():
+                continue
+            link.symlink_to(tool)
+    return sysbin
+
+
 def _run_verify_env(tmp_path: Path, stubs: dict[str, str]) -> subprocess.CompletedProcess:
     stub_dir = tmp_path / "bin"
     stub_dir.mkdir(parents=True, exist_ok=True)
@@ -269,7 +290,7 @@ def _run_verify_env(tmp_path: Path, stubs: dict[str, str]) -> subprocess.Complet
         stub.write_text(body, encoding="utf-8")
         stub.chmod(0o755)
     env = {
-        "PATH": f"{stub_dir}:/usr/bin:/bin",
+        "PATH": f"{stub_dir}:{_system_bin(tmp_path)}",
         "HOME": str(tmp_path),
         "TMPDIR": str(tmp_path),
     }
